@@ -1,6 +1,6 @@
 import requests as Requests
 from bs4 import BeautifulSoup
-import time, random, threading, sqlite3
+import time, random, threading, sqlite3, math
 from fake_useragent import UserAgent
 from requests_ip_rotator import ApiGateway, EXTRA_REGIONS
 from queue import Queue
@@ -19,8 +19,11 @@ set_horse_links=False
 
 def Header_Select(failures):
     
+    # Previously there was a list of headers that we would select from.
+    # This variable is, as of now, unneeded, but if it's needed we have it.
     select_number = failures
 
+    # With most random user agents we appear like a normal user
     headers = {
         'user-agent' :  UserAgent(platforms=['pc']).random,
         "Connection": "keep-alive",
@@ -35,38 +38,17 @@ def Header_Select(failures):
         "Accept-Language": "en-US,en;q=0.9"
     }
 
-    #print(headers)
-
     return headers
 
 headers = Header_Select(0)
 
-if set_horse_links:
-    with sqlite3.connect("horses.db") as sqlconnection:
-        sqlcursor = sqlconnection.cursor()
 
-        sqlcursor.execute(""" DROP TABLE IF EXISTS HORSES; """)
+# Step 1: Store the links for each horse's Bloodhorse page from their search index.
+# Step 1.5: We can save these links to optionally skip step 1 in the future, saving time.
+# Step 2: From each Bloodhorse page, we get the link to Equineline (mostly for the horse ID)
+# Step 3: We get the Equineline document and save its data to the SQLite database
 
-        table = """ CREATE TABLE HORSES (
-                    BH_link TEXT NOT NULL,
-                    Name TEXT,
-                    Crops TEXT,
-                    Foals TEXT,
-                    RA_Foals TEXT,
-                    Winners TEXT,
-                    Winners_B TEXT,
-                    Wins TEXT,
-                    Starters TEXT,
-                    Starts TEXT,
-                    Earnings TEXT,
-                    Num_Weanlings TEXT,
-                    Sales_Weanlings TEXT,
-                    Num_Yearlings TEXT,
-                    Sales_Yearlings TEXT
-                    ); """
-        sqlcursor.execute(table)
-
-def Bloodhorse_Get(starting_page_num, thread_num, out_q, accessKeyID, accessKeySecret):
+def Bloodhorse_Get(starting_page_num, thread_num, out_q, accessKeyID, accessKeySecret, page_range):
     global set_horse_links
 
     print(starting_page_num)
@@ -91,7 +73,7 @@ def Bloodhorse_Get(starting_page_num, thread_num, out_q, accessKeyID, accessKeyS
         session.mount("https://www.bloodhorse.com",gateway)
 
         connecting_url = url + str(pagenum) + url_addition
-        while pagenum <= starting_page_num + 20 and not all_links_added and bloodhorse_failures <= 5:
+        while pagenum <= starting_page_num + page_range and not all_links_added and bloodhorse_failures <= 5:
             
             print(f"THREAD {thread_num} Connecting to Bloodhorse; attempt #"+str(bloodhorse_failures +1) + "\nshould be page #"+str(pagenum+1))
 
@@ -167,27 +149,53 @@ def Process_SQL_Commands(in_q, thread_count):
     sqlconnection.commit()
 
 
-
+# This can be any unique identifier as long as Process_SQL_Commands() increases sentinel_count when received
 sentinel = "////"
 
-# Soon to be obsolete when thread constructor is made
-def Start_Threads(threadcount, accessID, accessKey):
+created_thread_list = []
+def Start_Threads(threadcount, pagecount, accessID, accessKey):
     q = Queue()
-    t4 = threading.Thread(target=Process_SQL_Commands, args=(q, 3, ))
-    t4.start()
+    queue_processor = threading.Thread(target=Process_SQL_Commands, args=(q, 3, ))
+    queue_processor.start()
 
-    t1 = threading.Thread(target=Bloodhorse_Get, args=(0, 1, q, ))
-    t2 = threading.Thread(target=Bloodhorse_Get, args=(21, 2, q, ))
-    t3 = threading.Thread(target=Bloodhorse_Get, args=(43, 3, q, ))
 
-    t1.start()
-    t2.start()
-    t3.start()
+    # Divides the number of pages as equally as possible among the chosen number of threads.
+    pages_per_thread = math.floor(pagecount / threadcount)
 
-    t1.join()
-    t2.join()
-    t3.join()
-    t4.join()
+    # Shows how many pages are left over.
+    remainder_pages = pagecount % threadcount
+
+    # If a thread is assigned additional pages, this variable updates the starting point for the other threads
+    carry = 0
+    # These two variables are (hopefully) for readability
+    count_from_first = 1
+    include_endpoint = 1
+
+    for i in range(threadcount):
+        start= (i*pages_per_thread) + carry + count_from_first
+        # Assign the remainder to a thread (and decrease the remaining remainder)
+        if i > threadcount - remainder_pages-1 and remainder_pages > 0:
+            carry += 1
+            remainder_pages -= 1
+        
+        end = (i+1) * pages_per_thread + carry
+
+        # Find the number of pages each thread takes care of
+        p_range = end + include_endpoint - start
+
+        # Create thread
+        thread = threading.Thread(target=Bloodhorse_Get, args=(start, i, q, accessID, accessKey, p_range, ))
+        
+        # Add to list of threads (in case needed later)
+        created_thread_list.append(thread)
+
+    for thread in created_thread_list:
+        thread.start()
+
+    for thread in created_thread_list:
+        thread.join()
+
+    queue_processor.join()
 
     q.join()
 
@@ -358,7 +366,34 @@ class App(Tk):
             print("AWS ID: " + self.AWS_ID, "AWS Secret: " + self.AWS_SECRET)
             print("Starting " + str(self.thcount.get()) + " Thread(s)")
             print("If setting links, checking " + str(self.pages) + " pages.")
-            
+
+            if set_horse_links:
+                with sqlite3.connect("horses.db") as sqlconnection:
+                    sqlcursor = sqlconnection.cursor()
+
+                    sqlcursor.execute(""" DROP TABLE IF EXISTS HORSES; """)
+
+                    table = """ CREATE TABLE HORSES (
+                                BH_link TEXT NOT NULL,
+                                Name TEXT,
+                                Crops TEXT,
+                                Foals TEXT,
+                                RA_Foals TEXT,
+                                Winners TEXT,
+                                Winners_B TEXT,
+                                Wins TEXT,
+                                Starters TEXT,
+                                Starts TEXT,
+                                Earnings TEXT,
+                                Num_Weanlings TEXT,
+                                Sales_Weanlings TEXT,
+                                Num_Yearlings TEXT,
+                                Sales_Yearlings TEXT
+                                ); """
+                    sqlcursor.execute(table)
+
+            Start_Threads(self.thcount.get(), self.pages, self.AWS_ID, self.AWS_SECRET)
+
 
 
 
@@ -387,6 +422,7 @@ class App(Tk):
         except ValueError:
             self.pagesNum.configure(text='Error NaN')
     
+    # Enter AWS information
     def setAWSID(self):
         self.AWS_ID = self.accessid_entry.get()
         self.accessid_entry.grid_forget()
@@ -401,6 +437,7 @@ class App(Tk):
         self.aws_secret_label.grid(column=0, row=4)
         self.set_aws_secret.grid_forget()
 
+    # Reset layout 
     def ResetClicked(self):
         self.aws_secret_label.grid_forget()
         self.aws_id_label.grid_forget()
@@ -410,7 +447,7 @@ class App(Tk):
         self.reset_widgets()
 
 
-
+# Run
 if __name__ == "__main__":
     app = App()
     app.mainloop()
