@@ -77,7 +77,7 @@ def Bloodhorse_Get(starting_page_num, thread_num, out_q, accessKeyID, accessKeyS
             
             print(f"THREAD {thread_num} Connecting to Bloodhorse; attempt #"+str(bloodhorse_failures +1) + "\nshould be page #"+str(pagenum+1))
 
-            time.sleep(10)
+            time.sleep(8)
 
             bloodhorse_response = session.post(connecting_url, headers=headers)
 
@@ -118,25 +118,158 @@ def Bloodhorse_Get(starting_page_num, thread_num, out_q, accessKeyID, accessKeyS
 
     if len(link_list) > 0:
         for i in range(len(link_list) -1):
-            sqlInsertRowString = f""" INSERT INTO HORSES (BH_link) VALUES({'"'+str(link_list[i])+'"'}); """
+            sqlInsertRowString = f""" INSERT OR IGNORE INTO HORSES (BH_link) VALUES({'"'+str(link_list[i])+'"'}); """
             out_q.put(sqlInsertRowString)
 
         print("sentinel " + str(thread_num))
 
     out_q.put(sentinel)
 
+def Bloodhorse_Find_Equineline(starting_index, thread_num, out_q, accessKeyID, accessKeySecret, index_range, bhorse_link_list):
+    global headers
+    global set_horse_links
+
+    bloodhorse_failures = 0
+
+    gateway = ApiGateway("https://www.bloodhorse.com", access_key_id=accessKeyID, access_key_secret=accessKeySecret)
+    gateway.start()
+
+
+    session = Requests.Session()
+    session.mount("https://www.bloodhorse.com",gateway)
+    
+    counter_index=starting_index
+    
+    if set_horse_links:
+        while counter_index <= starting_index + index_range and bloodhorse_failures <= 5:
+            link = bhorse_link_list[counter_index]
+            print("Fetching from "+link+" on thread #"+thread_num)
+
+            time.sleep(8)
+
+            bloodhorse_response = session.post(link, headers=headers)
+
+            bloodhorse_text = bloodhorse_response.text
+
+            bloodhorse_data = BeautifulSoup(bloodhorse_text, "html.parser")
+                
+            equineline_link_element = str(bloodhorse_data.find("a", attrs={"class":"equineline"}, recursive=True))
+
+            try:
+                equineline_link = equineline_link_element.split('href="')[1].split('" class')[0].replace("amp;", "").replace("bh.cfm?", "bh_main.cfm?")
+                counter_index +=1
+            except AttributeError:
+                print(f"Error getting equineline link (Thread #{thread_num}); trying with next headers")
+                bloodhorse_failures += 1
+                headers = Header_Select(bloodhorse_failures)
+            except Exception as exception:
+                if str(exception) is not str(AttributeError):
+                    print("----------- THREAD #"+thread_num+" Error: "+str(exception))
+                    equineline_link = exception
+                    counter_index +=1
+
+            sqlUpdateString = f""" UPDATE HORSES SET EQ_link = {'"'+str(equineline_link)+'"'} WHERE BH_link = {'"'+str(link)+'"'}; """
+            out_q.put(sqlUpdateString)
+
+    out_q.put(sentinel)
+
+def Equineline_Get(starting_index, thread_num, out_q, accessKeyID, accessKeySecret, index_range, eq_link_list):
+    global headers
+
+    name_index      =   [0, -1, -1]
+    crops_index     =   [3, 0]
+    foals_index     =   [4, 0]
+    RA_foals_index  =   [22, 4]
+    winners_index   =   [24, 4, 0]
+    b_winners_index =   [26, 3, 0]
+    starters_index  =   [23, 3, 0]
+    wins_index      =   [30, 2, 0]
+    starts_index    =   [29, 1]
+    earnings_index  =   [33, 1, 1]
+    weanlings_index =   [60, 1]
+    Wean_sales_index=   [60, 2, 1]
+    yearlings_index =   [61, 1]
+    Year_sales_index=   [61, 2, 1]
+
+
+    equineline_failures = 0
+
+    gateway = ApiGateway("http://www.equineline.com", access_key_id=accessKeyID, access_key_secret=accessKeySecret)
+    gateway.start()
+
+
+    session = Requests.Session()
+    session.mount("http://www.equineline.com",gateway)
+    
+    counter_index=0
+    while counter_index <= starting_index + index_range and equineline_failures <= 5:
+        link = eq_link_list[counter_index]
+        time.sleep(8)
+
+        equineline_response = session.get(link, headers=headers)
+
+        equineline_text = equineline_response.text
+        equineline_data = BeautifulSoup(equineline_text, "html.parser")
+
+        data = equineline_data.find_all("pre", recursive=True)
+
+        data = data[0] + data[1]
+
+        horse_data = data.splitlines()
+
+        # Until Equineline changes their data format, we know where each piece is stored (it's a <pre>)
+        name          = horse_data[name_index[0]].split(" ")[name_index[1]][:name_index[2]]
+        crops         = [data for data in horse_data[crops_index[0]].split(" ") if data != ''][crops_index[1]]
+        foals         = [data for data in horse_data[foals_index[0]].split(" ") if data != ''][foals_index[1]]
+        RA_foals      = [data for data in horse_data[RA_foals_index[0]].split(" ") if data != ''][RA_foals_index[1]]
+        winners       = [data for data in horse_data[winners_index[0]].split(" ") if data != ''][winners_index[1]].split("(")[winners_index[2]]
+        b_winners     = [data for data in horse_data[b_winners_index[0]].split(" ") if data != ''][b_winners_index[1]].split("(")[b_winners_index[2]]
+        starters      = [data for data in horse_data[starters_index[0]].split(" ") if data != ''][starters_index[1]].split("(")[starters_index[2]]
+        wins          = [data for data in horse_data[wins_index[0]].split(" ") if data != ''][wins_index[1]].split("(")[wins_index[2]]
+        starts        = [data for data in horse_data[starts_index[0]].split(" ") if data != ''][starts_index[1]]
+        earnings      = [data for data in horse_data[earnings_index[0]].split(" ") if data !=''][earnings_index[1]][earnings_index[2]:]
+        num_weanlings = [data for data in horse_data[weanlings_index[0]].split(" ") if data !=''][weanlings_index[1]]
+        sale_weanling = [data for data in horse_data[Wean_sales_index[0]].split(" ") if data !=''][Wean_sales_index[1]][Wean_sales_index[2]:]
+        num_yearlings = [data for data in horse_data[yearlings_index[0]].split(" ") if data !=''][yearlings_index[1]]
+        sale_yearling = [data for data in horse_data[Year_sales_index[0]].split(" ") if data !=''][Year_sales_index[1]][Year_sales_index[2]:]
+
+        sqlUpdateString = f""" UPDATE HORSES SET 
+                            Name = {'"'+name+'"'}, 
+                            Crops = {'"'+crops+'"'},
+                            Foals = {'"'+foals+'"'},
+                            RA_Foals = {'"'+RA_foals+'"'},
+                            Winners = {'"'+winners+'"'},
+                            Winners_B = {'"'+b_winners+'"'},
+                            Wins = {'"'+wins+'"'},
+                            Starters = {'"'+starters+'"'},
+                            Starts = {'"'+starts+'"'},
+                            Earnings = {'"'+earnings+'"'},
+                            Num_Weanlings = {'"'+num_weanlings+'"'},
+                            Sales_Weanlings = {'"'+sale_weanling+'"'},
+                            Num_Yearlings = {'"'+num_yearlings+'"'},
+                            Sales_Yearlings = {'"'+sale_yearling+'"'},
+                            WHERE EQ_link = {'"'+str(link)+'"'}; """
+        out_q.put(sqlUpdateString)
+
+    out_q.put(sentinel)
+
+
+        
+
+
+
+
+
+        
+
 def Process_SQL_Commands(in_q, thread_count):
-    sqlconnection = sqlite3.connect("horses.db", timeout=10)
+
+    sqlconnection = sqlite3.connect("horses.db", timeout=8)
     sqlcursor = sqlconnection.cursor()
 
     sentinel_count = 0
 
     while True:
-         
-        if sentinel_count == thread_count:
-            sqlcursor.close()
-            break
-
         command = in_q.get()
 
         if command == "////":
@@ -145,6 +278,11 @@ def Process_SQL_Commands(in_q, thread_count):
             sqlcursor.execute(command)
 
         in_q.task_done()
+        
+        if sentinel_count == thread_count:
+            print("Queue emptied.")
+            sqlcursor.close()
+            break
 
     sqlconnection.commit()
 
@@ -153,17 +291,17 @@ def Process_SQL_Commands(in_q, thread_count):
 sentinel = "////"
 
 created_thread_list = []
-def Start_Threads(threadcount, pagecount, accessID, accessKey):
+def Start_Threads(threadcount, taskcount, accessID, accessKey, target_function, param=None):
     q = Queue()
-    queue_processor = threading.Thread(target=Process_SQL_Commands, args=(q, 3, ))
+    queue_processor = threading.Thread(target=Process_SQL_Commands, args=(q, threadcount, ))
     queue_processor.start()
 
 
     # Divides the number of pages as equally as possible among the chosen number of threads.
-    pages_per_thread = math.floor(pagecount / threadcount)
+    tasks_per_thread = math.floor(taskcount / threadcount)
 
     # Shows how many pages are left over.
-    remainder_pages = pagecount % threadcount
+    remainder_tasks = taskcount % threadcount
 
     # If a thread is assigned additional pages, this variable updates the starting point for the other threads
     carry = 0
@@ -171,20 +309,21 @@ def Start_Threads(threadcount, pagecount, accessID, accessKey):
     count_from_first = 1
     include_endpoint = 1
 
-    for i in range(threadcount):
-        start= (i*pages_per_thread) + carry + count_from_first
+    for threadnum in range(threadcount):
+        start= (threadnum*tasks_per_thread) + carry + (count_from_first if target_function == Bloodhorse_Get else 0)
+
         # Assign the remainder to a thread (and decrease the remaining remainder)
-        if i > threadcount - remainder_pages-1 and remainder_pages > 0:
+        if threadnum > threadcount - remainder_tasks-1 and remainder_tasks > 0:
             carry += 1
-            remainder_pages -= 1
+            remainder_tasks -= 1
         
-        end = (i+1) * pages_per_thread + carry
+        end = (threadnum+1) * tasks_per_thread + carry
 
         # Find the number of pages each thread takes care of
         p_range = end + include_endpoint - start
 
         # Create thread
-        thread = threading.Thread(target=Bloodhorse_Get, args=(start, i, q, accessID, accessKey, p_range, ))
+        thread = threading.Thread(target=target_function, args=(start, threadnum, q, accessID, accessKey, p_range, param))
         
         # Add to list of threads (in case needed later)
         created_thread_list.append(thread)
@@ -195,9 +334,15 @@ def Start_Threads(threadcount, pagecount, accessID, accessKey):
     for thread in created_thread_list:
         thread.join()
 
-    queue_processor.join()
-
     q.join()
+
+    queue_processor.join()
+    
+    print(str(threadcount) + " Threads finished.")
+
+    
+
+
 
 # TKinter App
 class App(Tk):
@@ -231,15 +376,15 @@ class App(Tk):
         self.linkupdate.grid(column=1,row=0)
 
         # Start Button
-        self.btn = Button(self, text = 'Start',
+        self.btn_start = Button(self, text = 'Start',
             fg= 'red', command=self.start_clicked)
-        self.btn.grid(column=5,row=6)
+        self.btn_start.grid(column=5,row=6)
     
         # Thread Count Selection Menu
         self.thcountMenu = Menubutton(self, text="-> Select Thread Count")
 
         self.menu = Menu(self.thcountMenu, tearoff=0)
-        for i in range(1, 9):
+        for i in range(1, 17):
             self.menu.add_radiobutton(label=i,variable=self.thcount, command=self.Select_Thread_Num)
 
         self.thcountMenu["menu"] = self.menu
@@ -277,8 +422,8 @@ class App(Tk):
         self.page_entry_button.grid(row=2, column=5)
 
         # Page number display
-        self.pagesNum = Label(text='Detect or enter pages.\n(If setting links)')
-        self.pagesNum.grid(row=0, column=5)
+        self.TaskNumDisplay = Label(text='Detect or enter pages.\n(If setting links)')
+        self.TaskNumDisplay.grid(row=0, column=5)
 
         # Warning
         self.warning = Label(text='Make sure all your information is correct.')
@@ -305,7 +450,7 @@ class App(Tk):
 
         self.linkupdate.grid(column=1,row=0)
 
-        self.btn.grid(column=5,row=6)
+        self.btn_start.grid(column=5,row=6)
         self.thcountMenu.grid(column=1, row=1)
 
  
@@ -327,7 +472,7 @@ class App(Tk):
 
         self.page_entry_button.grid(row=2, column=5)
 
-        self.pagesNum.configure(text='Detect or enter pages.')
+        self.TaskNumDisplay.configure(text='Detect or enter pages.')
 
         self.warning.grid(row=5, column=5)
 
@@ -341,7 +486,7 @@ class App(Tk):
     def start_clicked(self):
         global set_horse_links
         self.lbl.configure(text='Running')
-        self.btn.grid_forget()
+        self.btn_start.grid_forget()
         self.linkupdate.grid_forget()
         
         self.page_entry_button.grid_forget()
@@ -355,6 +500,7 @@ class App(Tk):
 
         self.setAWSID()
         self.setAWSSECRET()
+        self.update()
 
         if self.AWS_ID == '' or self.AWS_SECRET == '' or (set_horse_links and self.pages == 0):
             self.unset_values.configure(text='Missing required values (Check page count and AWS)\nClick Reset to continue')
@@ -374,7 +520,8 @@ class App(Tk):
                     sqlcursor.execute(""" DROP TABLE IF EXISTS HORSES; """)
 
                     table = """ CREATE TABLE HORSES (
-                                BH_link TEXT NOT NULL,
+                                BH_link TEXT UNIQUE NOT NULL,
+                                EQ_link TEXT,
                                 Name TEXT,
                                 Crops TEXT,
                                 Foals TEXT,
@@ -392,7 +539,29 @@ class App(Tk):
                                 ); """
                     sqlcursor.execute(table)
 
-            Start_Threads(self.thcount.get(), self.pages, self.AWS_ID, self.AWS_SECRET)
+            Start_Threads(self.thcount.get(), self.pages, self.AWS_ID, self.AWS_SECRET, Bloodhorse_Get)
+
+            self.lbl.configure(text='Bloodhorse Links Saved.')
+
+            
+
+            with sqlite3.connect("horses.db") as sqlconnection:
+                sqlcursor = sqlconnection.cursor()
+
+                count = sqlcursor.execute(" SELECT COUNT (BH_LINK) FROM HORSES; ")
+                countINT = count.fetchone()[0]
+                print(str(countINT) + " Links found." )
+                self.TaskNumDisplay.configure(text="Getting Equineline data for:\n"+ str(countINT) +" horses.")
+
+                bh_links = [bh_links[0] for bh_links in sqlcursor.execute(" SELECT BH_LINK FROM HORSES; ")]
+
+                sqlconnection.commit()
+                
+            self.update()
+
+            Start_Threads(self.thcount.get(), countINT, self.AWS_ID, self.AWS_SECRET, Bloodhorse_Find_Equineline, bh_links)
+
+
 
 
 
@@ -410,17 +579,17 @@ class App(Tk):
             bh_data = BeautifulSoup(bh_text, "html.parser")   
             last_page = bh_data.find("a", attrs={"class":"last"}, recursive=True)
             self.pages=int(str(last_page).split('Page=')[1].split('&')[0])
-            self.pagesNum.configure(text='Pages: '+ str(self.pages))
+            self.TaskNumDisplay.configure(text='Pages: '+ str(self.pages))
         except IndexError:
-            self.pagesNum.configure(text='Error getting page count.\nTry manually setting a number\nor trying again.')
+            self.TaskNumDisplay.configure(text='Error getting page count.\nTry manually setting a number\nor trying again.')
     
     # Update Page Number Manually
     def enterPages(self):
         try:
             self.pages = int(self.page_entry.get())
-            self.pagesNum.configure(text='Pages: '+ str(self.pages))
+            self.TaskNumDisplay.configure(text='Pages: '+ str(self.pages))
         except ValueError:
-            self.pagesNum.configure(text='Error NaN')
+            self.TaskNumDisplay.configure(text='Error NaN')
     
     # Enter AWS information
     def setAWSID(self):
