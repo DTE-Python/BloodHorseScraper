@@ -1,6 +1,6 @@
 import requests as Requests
 from bs4 import BeautifulSoup
-import time, random, threading, sqlite3, math
+import time, threading, sqlite3, math, logging, os
 from fake_useragent import UserAgent
 from requests_ip_rotator import ApiGateway, EXTRA_REGIONS
 from queue import Queue
@@ -8,15 +8,17 @@ from tkinter import *
 
 global headers
 
-horse_object_list = []
-
-url = "https://www.bloodhorse.com/stallion-register/Results/ResultsTable?ReferenceNumber=0&Page="
+search_page_url = "https://www.bloodhorse.com/stallion-register/Results/ResultsTable?ReferenceNumber=0&Page="
 url_addition = "&IncludePrivateFees=False"
 url_base = "https://www.bloodhorse.com"
 
+# Set this to true if you want to set links by default (Update: shouldn't matter, set in GUI)
 global set_horse_links
 set_horse_links=False
 
+logging.basicConfig(filename="webscraper.log", level=logging.INFO)
+
+# Set the headers to be used when making a request
 def Header_Select(failures):
     
     # Previously there was a list of headers that we would select from.
@@ -42,16 +44,16 @@ def Header_Select(failures):
 
 headers = Header_Select(0)
 
-
 # Step 1: Store the links for each horse's Bloodhorse page from their search index.
-# Step 1.5: We can save these links to optionally skip step 1 in the future, saving time.
-# Step 2: From each Bloodhorse page, we get the link to Equineline (mostly for the horse ID)
+# Step 2: From each Bloodhorse page, we get the link to Equineline
+# Step 2.5: We save the links used to save time in the future
 # Step 3: We get the Equineline document and save its data to the SQLite database
 
-def Bloodhorse_Get(starting_page_num, thread_num, out_q, accessKeyID, accessKeySecret, page_range):
+# Comb the search page from Bloodhorse to get links to all the horses
+def Bloodhorse_Get(starting_page_num, thread_num, out_q, accessKeyID, accessKeySecret, page_range, args):
     global set_horse_links
 
-    print(starting_page_num)
+    logging.info("Thread " + str(thread_num) + " Starting on Bloodhorse page: " + str(starting_page_num))
 
     link_list = []
     
@@ -72,12 +74,12 @@ def Bloodhorse_Get(starting_page_num, thread_num, out_q, accessKeyID, accessKeyS
         session = Requests.Session()
         session.mount("https://www.bloodhorse.com",gateway)
 
-        connecting_url = url + str(pagenum) + url_addition
-        while pagenum <= starting_page_num + page_range and not all_links_added and bloodhorse_failures <= 5:
+        connecting_url = search_page_url + str(pagenum) + url_addition
+        while pagenum <= starting_page_num + page_range and not all_links_added and bloodhorse_failures <= max_errors:
             
-            print(f"THREAD {thread_num} Connecting to Bloodhorse; attempt #"+str(bloodhorse_failures +1) + "\nshould be page #"+str(pagenum+1))
+            logging.info(f"THREAD {thread_num} Connecting to Bloodhorse; attempt #"+str(bloodhorse_failures +1) + "\nshould be page #"+str(pagenum+1))
 
-            time.sleep(8)
+            time.sleep(request_delay)
 
             bloodhorse_response = session.post(connecting_url, headers=headers)
 
@@ -94,14 +96,17 @@ def Bloodhorse_Get(starting_page_num, thread_num, out_q, accessKeyID, accessKeyS
             
                     
             try:
+                # Attempting to create this test_url will give an index failure if we haven't found the next page link
+                # Which is how I test for a successful connection
+                # The specific indexing and formatting is from old iterations, not needed.
                 test_url = url_base + str(next_page).split('href="')[1].split('">')[0].replace("amp;", "")
                 pagenum += 1
 
-                connecting_url = url + str(pagenum) + url_addition
+                connecting_url = search_page_url + str(pagenum) + url_addition
 
-                print(connecting_url)
+                logging.info("Thread " + str(thread_num) + " Will connect to " + connecting_url +" next.")
             except IndexError:
-                print("Error getting next page; trying with next headers")
+                logging.error("Thread " + str(thread_num) + ": Error getting next page; trying with new headers")
                 bloodhorse_failures += 1
                 headers = Header_Select(bloodhorse_failures)
             
@@ -116,15 +121,21 @@ def Bloodhorse_Get(starting_page_num, thread_num, out_q, accessKeyID, accessKeyS
                         if link not in link_list:
                             link_list.append(link)
 
+            if bloodhorse_failures >= max_errors:
+                logging.error("Thread " + str(thread_num) + " Unable to progress. (Max attempts reached)")
+
     if len(link_list) > 0:
         for i in range(len(link_list) -1):
-            sqlInsertRowString = f""" INSERT OR IGNORE INTO HORSES (BH_link) VALUES({'"'+str(link_list[i])+'"'}); """
-            out_q.put(sqlInsertRowString)
+            sqlInsertRowString = " INSERT OR IGNORE INTO HORSES (BH_link) VALUES (?); "
+            sqlInsertRowValue = (link_list[i],)
 
-        print("sentinel " + str(thread_num))
+            out_q.put((sqlInsertRowString, sqlInsertRowValue,))
+
+        logging.info("Thread " + str(thread_num) + " sent sentinel.")
 
     out_q.put(sentinel)
 
+# Get the Equineline links from each horse's Bloodhorse page
 def Bloodhorse_Find_Equineline(starting_index, thread_num, out_q, accessKeyID, accessKeySecret, index_range, bhorse_link_list):
     global headers
     global set_horse_links
@@ -141,11 +152,11 @@ def Bloodhorse_Find_Equineline(starting_index, thread_num, out_q, accessKeyID, a
     counter_index=starting_index
     
     if set_horse_links:
-        while counter_index <= starting_index + index_range and bloodhorse_failures <= 5:
+        while counter_index <= starting_index + index_range:
             link = bhorse_link_list[counter_index]
-            print("Fetching from "+link+" on thread #"+thread_num)
+            logging.info("Fetching Equineline link from "+link+" on thread #"+str(thread_num))
 
-            time.sleep(8)
+            time.sleep(request_delay)
 
             bloodhorse_response = session.post(link, headers=headers)
 
@@ -156,26 +167,42 @@ def Bloodhorse_Find_Equineline(starting_index, thread_num, out_q, accessKeyID, a
             equineline_link_element = str(bloodhorse_data.find("a", attrs={"class":"equineline"}, recursive=True))
 
             try:
-                equineline_link = equineline_link_element.split('href="')[1].split('" class')[0].replace("amp;", "").replace("bh.cfm?", "bh_main.cfm?")
+                # The equineline page by default doesn't have the plaintext, but by modifying the link we can get to the page that does
+                equineline_link = equineline_link_element.split('href="')[1].split('" class')[0].replace("amp;", "").replace("bh.cfm?", "bh_main.cfm?").split(" ")[0]
                 counter_index +=1
             except AttributeError:
-                print(f"Error getting equineline link (Thread #{thread_num}); trying with next headers")
+                logging.error(f"Error getting equineline link (Thread #{thread_num}); trying with next headers")
                 bloodhorse_failures += 1
                 headers = Header_Select(bloodhorse_failures)
             except Exception as exception:
+
+                # It's possible that an unpredicted error occurs with one link, in which case we should skip it
                 if str(exception) is not str(AttributeError):
-                    print("----------- THREAD #"+thread_num+" Error: "+str(exception))
-                    equineline_link = exception
+                    logging.error("-"*thread_num +"THREAD #"+str(thread_num)+" Unhandled Error: "+str(exception))
+                    equineline_link = "ERROR"
                     counter_index +=1
 
-            sqlUpdateString = f""" UPDATE HORSES SET EQ_link = {'"'+str(equineline_link)+'"'} WHERE BH_link = {'"'+str(link)+'"'}; """
-            out_q.put(sqlUpdateString)
+            sqlUpdateString = " UPDATE HORSES SET EQ_link = ? WHERE BH_link IS ?; "
+            sqlUpdateValue = (equineline_link, link,)
+
+            out_q.put((sqlUpdateString,sqlUpdateValue,))
+
+            if bloodhorse_failures >= max_errors:
+                counter_index +=1
+                bloodhorse_failures = 0
 
     out_q.put(sentinel)
 
+# Fetch and add data from Equineline to the SQLite database
 def Equineline_Get(starting_index, thread_num, out_q, accessKeyID, accessKeySecret, index_range, eq_link_list):
     global headers
 
+    # The data is split by lines, so to adjust this find the line with the data you need
+    # and find how many lines down it is, with the top line being zero (the empty lines DO COUNT)
+    # then use that number instead of the first number in the list.
+    # The data is then split on the " " characters (removing extra), so "hello world" becomes [hello,world]
+    # to adjust these, find how many across your data is, and use that number instead of the second number. 
+    # The third one is for additional formatting. If you aren't sure if you need it, remove it.
     name_index      =   [0, -1, -1]
     crops_index     =   [3, 0]
     foals_index     =   [4, 0]
@@ -202,9 +229,10 @@ def Equineline_Get(starting_index, thread_num, out_q, accessKeyID, accessKeySecr
     session.mount("http://www.equineline.com",gateway)
     
     counter_index=0
-    while counter_index <= starting_index + index_range and equineline_failures <= 5:
+    while counter_index <= starting_index + index_range:
+
         link = eq_link_list[counter_index]
-        time.sleep(8)
+        time.sleep(request_delay)
 
         equineline_response = session.get(link, headers=headers)
 
@@ -212,59 +240,79 @@ def Equineline_Get(starting_index, thread_num, out_q, accessKeyID, accessKeySecr
         equineline_data = BeautifulSoup(equineline_text, "html.parser")
 
         data = equineline_data.find_all("pre", recursive=True)
+        
+        try:
+            data = data[0] + data[1]
 
-        data = data[0] + data[1]
+            horse_data = data.splitlines()
 
-        horse_data = data.splitlines()
+            # Until Equineline changes their data format, we know where each piece is stored (it's a <pre>)
+            name          = horse_data[name_index[0]].split(" ")[name_index[1]][:name_index[2]]
+            crops         = [data for data in horse_data[crops_index[0]].split(" ") if data != ''][crops_index[1]]
+            foals         = [data for data in horse_data[foals_index[0]].split(" ") if data != ''][foals_index[1]]
+            RA_foals      = [data for data in horse_data[RA_foals_index[0]].split(" ") if data != ''][RA_foals_index[1]]
+            winners       = [data for data in horse_data[winners_index[0]].split(" ") if data != ''][winners_index[1]].split("(")[winners_index[2]]
+            b_winners     = [data for data in horse_data[b_winners_index[0]].split(" ") if data != ''][b_winners_index[1]].split("(")[b_winners_index[2]]
+            starters      = [data for data in horse_data[starters_index[0]].split(" ") if data != ''][starters_index[1]].split("(")[starters_index[2]]
+            wins          = [data for data in horse_data[wins_index[0]].split(" ") if data != ''][wins_index[1]].split("(")[wins_index[2]]
+            starts        = [data for data in horse_data[starts_index[0]].split(" ") if data != ''][starts_index[1]]
+            earnings      = [data for data in horse_data[earnings_index[0]].split(" ") if data !=''][earnings_index[1]][earnings_index[2]:]
+            num_weanlings = [data for data in horse_data[weanlings_index[0]].split(" ") if data !=''][weanlings_index[1]]
+            sale_weanling = [data for data in horse_data[Wean_sales_index[0]].split(" ") if data !=''][Wean_sales_index[1]][Wean_sales_index[2]:]
+            num_yearlings = [data for data in horse_data[yearlings_index[0]].split(" ") if data !=''][yearlings_index[1]]
+            sale_yearling = [data for data in horse_data[Year_sales_index[0]].split(" ") if data !=''][Year_sales_index[1]][Year_sales_index[2]:]
 
-        # Until Equineline changes their data format, we know where each piece is stored (it's a <pre>)
-        name          = horse_data[name_index[0]].split(" ")[name_index[1]][:name_index[2]]
-        crops         = [data for data in horse_data[crops_index[0]].split(" ") if data != ''][crops_index[1]]
-        foals         = [data for data in horse_data[foals_index[0]].split(" ") if data != ''][foals_index[1]]
-        RA_foals      = [data for data in horse_data[RA_foals_index[0]].split(" ") if data != ''][RA_foals_index[1]]
-        winners       = [data for data in horse_data[winners_index[0]].split(" ") if data != ''][winners_index[1]].split("(")[winners_index[2]]
-        b_winners     = [data for data in horse_data[b_winners_index[0]].split(" ") if data != ''][b_winners_index[1]].split("(")[b_winners_index[2]]
-        starters      = [data for data in horse_data[starters_index[0]].split(" ") if data != ''][starters_index[1]].split("(")[starters_index[2]]
-        wins          = [data for data in horse_data[wins_index[0]].split(" ") if data != ''][wins_index[1]].split("(")[wins_index[2]]
-        starts        = [data for data in horse_data[starts_index[0]].split(" ") if data != ''][starts_index[1]]
-        earnings      = [data for data in horse_data[earnings_index[0]].split(" ") if data !=''][earnings_index[1]][earnings_index[2]:]
-        num_weanlings = [data for data in horse_data[weanlings_index[0]].split(" ") if data !=''][weanlings_index[1]]
-        sale_weanling = [data for data in horse_data[Wean_sales_index[0]].split(" ") if data !=''][Wean_sales_index[1]][Wean_sales_index[2]:]
-        num_yearlings = [data for data in horse_data[yearlings_index[0]].split(" ") if data !=''][yearlings_index[1]]
-        sale_yearling = [data for data in horse_data[Year_sales_index[0]].split(" ") if data !=''][Year_sales_index[1]][Year_sales_index[2]:]
+            # Add data to SQLite database
+            sqlUpdateString = """ UPDATE HORSES SET 
+                                Name = ?, 
+                                Crops = ?,
+                                Foals = ?,
+                                RA_Foals = ?,
+                                Winners = ?,
+                                Winners_B = ?,
+                                Wins = ?,
+                                Starters = ?,
+                                Starts = ?,
+                                Earnings = ?,
+                                Num_Weanlings = ?,
+                                Sales_Weanlings = ?,
+                                Num_Yearlings = ?,
+                                Sales_Yearlings = ?,
+                                WHERE EQ_link = ?; """ 
+            sqlUpdateValues = (name, 
+                                crops, 
+                                foals, 
+                                RA_foals, 
+                                winners, 
+                                b_winners, 
+                                wins, 
+                                starters,
+                                starts,
+                                earnings,
+                                num_weanlings,
+                                sale_weanling,
+                                num_yearlings,
+                                sale_yearling,
+                                str(link),)
+            
+            out_q.put((sqlUpdateString, sqlUpdateValues,))
+            counter_index +=1
 
-        sqlUpdateString = f""" UPDATE HORSES SET 
-                            Name = {'"'+name+'"'}, 
-                            Crops = {'"'+crops+'"'},
-                            Foals = {'"'+foals+'"'},
-                            RA_Foals = {'"'+RA_foals+'"'},
-                            Winners = {'"'+winners+'"'},
-                            Winners_B = {'"'+b_winners+'"'},
-                            Wins = {'"'+wins+'"'},
-                            Starters = {'"'+starters+'"'},
-                            Starts = {'"'+starts+'"'},
-                            Earnings = {'"'+earnings+'"'},
-                            Num_Weanlings = {'"'+num_weanlings+'"'},
-                            Sales_Weanlings = {'"'+sale_weanling+'"'},
-                            Num_Yearlings = {'"'+num_yearlings+'"'},
-                            Sales_Yearlings = {'"'+sale_yearling+'"'},
-                            WHERE EQ_link = {'"'+str(link)+'"'}; """
-        out_q.put(sqlUpdateString)
+        except Exception as e:
+            logging.error(("-"*thread_num) + "ERROR ON THREAD "+ str(thread_num) +":\n"+str(e)+"\nTrying with new headers, " + str(max_errors - equineline_failures) + " tries until moving on")
+            equineline_failures += 1
+            headers = Header_Select(equineline_failures)
+
+        if equineline_failures >= max_errors:
+            counter_index +=1
+            equineline_failures = 0
 
     out_q.put(sentinel)
 
-
-        
-
-
-
-
-
-        
-
+# Execute SQL commands from the queue
 def Process_SQL_Commands(in_q, thread_count):
 
-    sqlconnection = sqlite3.connect("horses.db", timeout=8)
+    sqlconnection = sqlite3.connect("horses.db")
     sqlcursor = sqlconnection.cursor()
 
     sentinel_count = 0
@@ -275,23 +323,31 @@ def Process_SQL_Commands(in_q, thread_count):
         if command == "////":
             sentinel_count +=1
         else:
-            sqlcursor.execute(command)
+            try:
+                sqlCommand =  command[0]
+                sqlValues = command[1]
+                sqlcursor.execute(sqlCommand, sqlValues)
+            except Exception as e:
+                logging.error("Error with SQL execution:\nSQL:\n" + str(sqlCommand) +"\n"+ str(sqlValues) +"\nError:\n"+str(e))
+                os._exit(1)
+
 
         in_q.task_done()
         
-        if sentinel_count == thread_count:
-            print("Queue emptied.")
+        if sentinel_count == thread_count and in_q.qsize() == 0:
+            logging.info("Queue emptied.")
             sqlcursor.close()
             break
 
     sqlconnection.commit()
 
-
 # This can be any unique identifier as long as Process_SQL_Commands() increases sentinel_count when received
 sentinel = "////"
 
-created_thread_list = []
+
 def Start_Threads(threadcount, taskcount, accessID, accessKey, target_function, param=None):
+    created_thread_list = []
+
     q = Queue()
     queue_processor = threading.Thread(target=Process_SQL_Commands, args=(q, threadcount, ))
     queue_processor.start()
@@ -323,7 +379,7 @@ def Start_Threads(threadcount, taskcount, accessID, accessKey, target_function, 
         p_range = end + include_endpoint - start
 
         # Create thread
-        thread = threading.Thread(target=target_function, args=(start, threadnum, q, accessID, accessKey, p_range, param))
+        thread = threading.Thread(target=target_function, args=(start, threadnum, q, accessID, accessKey, p_range, param, ))
         
         # Add to list of threads (in case needed later)
         created_thread_list.append(thread)
@@ -338,12 +394,9 @@ def Start_Threads(threadcount, taskcount, accessID, accessKey, target_function, 
 
     queue_processor.join()
     
-    print(str(threadcount) + " Threads finished.")
+    logging.debug(str(threadcount) + " Threads finished.")
 
     
-
-
-
 # TKinter App
 class App(Tk):
 
@@ -508,10 +561,10 @@ class App(Tk):
         else:
             self.reset_button.grid_forget()
 
-            print("Setting links: " + str(set_horse_links))
-            print("AWS ID: " + self.AWS_ID, "AWS Secret: " + self.AWS_SECRET)
-            print("Starting " + str(self.thcount.get()) + " Thread(s)")
-            print("If setting links, checking " + str(self.pages) + " pages.")
+            logging.debug("Setting links: " + str(set_horse_links))
+            logging.debug("AWS ID: " + self.AWS_ID, "AWS Secret: " + self.AWS_SECRET)
+            logging.debug("Starting " + str(self.thcount.get()) + " Thread(s)")
+            logging.debug("If setting links, checking " + str(self.pages) + " pages.")
 
             if set_horse_links:
                 with sqlite3.connect("horses.db") as sqlconnection:
@@ -543,29 +596,47 @@ class App(Tk):
 
             self.lbl.configure(text='Bloodhorse Links Saved.')
 
-            
 
             with sqlite3.connect("horses.db") as sqlconnection:
                 sqlcursor = sqlconnection.cursor()
 
-                count = sqlcursor.execute(" SELECT COUNT (BH_LINK) FROM HORSES; ")
+                count = sqlcursor.execute(" SELECT COUNT (BH_link) FROM HORSES; ")
                 countINT = count.fetchone()[0]
-                print(str(countINT) + " Links found." )
-                self.TaskNumDisplay.configure(text="Getting Equineline data for:\n"+ str(countINT) +" horses.")
+                logging.info(str(countINT) + " Horse links found from Bloodhorse." )
+                self.TaskNumDisplay.configure(text="Getting Equineline links for:\n"+ str(countINT) +" horses.")
+            
 
-                bh_links = [bh_links[0] for bh_links in sqlcursor.execute(" SELECT BH_LINK FROM HORSES; ")]
+                bh_links = [bh_links[0] for bh_links in sqlcursor.execute(" SELECT BH_link FROM HORSES; ")]
 
-                sqlconnection.commit()
-                
+                logging.debug("Bloodhorse link list value 1: " + bh_links[0])
+
             self.update()
 
             Start_Threads(self.thcount.get(), countINT, self.AWS_ID, self.AWS_SECRET, Bloodhorse_Find_Equineline, bh_links)
 
+            self.lbl.configure(text="Equineline links fetched from Bloodhorse.")
 
+            with sqlite3.connect("horses.db") as sqlconnection:
+                sqlcursor = sqlconnection.cursor()
 
+                eq_count = sqlcursor.execute(""" SELECT COUNT (EQ_link) FROM HORSES WHERE EQ_link != "ERROR" """)
+                eq_countINT = eq_count.fetchone()[0]
+                logging.info(str(eq_countINT) + " Equineline links found from Bloodhorse.")
+                self.TaskNumDisplay.configure(text="Getting data from Equineline for:\n" + str(eq_countINT) + " horses.")
 
+                eq_links = [eq_links[0] for eq_links in sqlcursor.execute(""" SELECT EQ_link FROM HORSES WHERE EQ_link != "ERROR" """)]
 
+                try:
+                    logging.debug("Equineline link list value 1: " + eq_links[0])
+                except IndexError:
+                    logging.error("No Equineline links set.")
+            
+            self.update()
 
+            Start_Threads(self.thcount.get(), eq_countINT, self.AWS_ID, self.AWS_SECRET, Equineline_Get, eq_links)
+
+            self.lbl.configure(text=" Equineline data entered.\nComplete.")
+                
 
     # Update Thread Number
     def Select_Thread_Num(self):
@@ -574,7 +645,7 @@ class App(Tk):
     # Auto-Detect Page Number
     def pageCount_clicked(self, *args):
         try:
-            bh_response = Requests.post(url=url + '1' + url_addition, headers=Header_Select(0))
+            bh_response = Requests.post(url=search_page_url + '1' + url_addition, headers=Header_Select(0))
             bh_text = bh_response.text
             bh_data = BeautifulSoup(bh_text, "html.parser")   
             last_page = bh_data.find("a", attrs={"class":"last"}, recursive=True)
@@ -615,6 +686,9 @@ class App(Tk):
         
         self.reset_widgets()
 
+# These can really be any numbers
+max_errors = 5
+request_delay = 8
 
 # Run
 if __name__ == "__main__":
