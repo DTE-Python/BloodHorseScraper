@@ -153,6 +153,10 @@ def Bloodhorse_Find_Equineline(starting_index, thread_num, out_q, accessKeyID, a
     
     if set_horse_links:
         while counter_index <= starting_index + index_range:
+            if counter_index >= len(bhorse_link_list):
+                logging.info("Breaking thread: " + str(thread_num) + " (Completed list)")
+                break
+
             link = bhorse_link_list[counter_index]
             logging.info("Fetching Equineline link from "+link+" on thread #"+str(thread_num))
 
@@ -164,7 +168,7 @@ def Bloodhorse_Find_Equineline(starting_index, thread_num, out_q, accessKeyID, a
 
             bloodhorse_data = BeautifulSoup(bloodhorse_text, "html.parser")
                 
-            equineline_link_element = str(bloodhorse_data.find("a", attrs={"class":"equineline"}, recursive=True))
+            equineline_link_element = str(bloodhorse_data.find("a", attrs={"class":"equineline", "target":"_blank"}, recursive=True))
 
             try:
                 # The equineline page by default doesn't have the plaintext, but by modifying the link we can get to the page that does
@@ -203,16 +207,16 @@ def Equineline_Get(starting_index, thread_num, out_q, accessKeyID, accessKeySecr
     # The data is then split on the " " characters (removing extra), so "hello world" becomes [hello,world]
     # to adjust these, find how many across your data is, and use that number instead of the second number. 
     # The third one is for additional formatting. If you aren't sure if you need it, remove it.
-    name_index      =   [0, -1, -1]
-    crops_index     =   [3, 0]
-    foals_index     =   [4, 0]
-    RA_foals_index  =   [22, 4]
-    winners_index   =   [24, 4, 0]
-    b_winners_index =   [26, 3, 0]
-    starters_index  =   [23, 3, 0]
-    wins_index      =   [30, 2, 0]
-    starts_index    =   [29, 1]
-    earnings_index  =   [33, 1, 1]
+    name_index      =   [2, -1]
+    crops_index     =   [5, 0]
+    foals_index     =   [6, 0]
+    RA_foals_index  =   [24, 4]
+    winners_index   =   [26, 4, 0]
+    b_winners_index =   [28, 3, 0]
+    starters_index  =   [25, 3, 0]
+    wins_index      =   [32, 2, 0]
+    starts_index    =   [31, 1]
+    earnings_index  =   [35, 1, 1]
     weanlings_index =   [60, 1]
     Wean_sales_index=   [60, 2, 1]
     yearlings_index =   [61, 1]
@@ -231,6 +235,10 @@ def Equineline_Get(starting_index, thread_num, out_q, accessKeyID, accessKeySecr
     counter_index=0
     while counter_index <= starting_index + index_range:
 
+        if counter_index >= len(eq_link_list):
+            logging.info("Breaking thread: " + str(thread_num) + " (Completed list)")
+            break
+
         link = eq_link_list[counter_index]
         time.sleep(request_delay)
 
@@ -240,14 +248,29 @@ def Equineline_Get(starting_index, thread_num, out_q, accessKeyID, accessKeySecr
         equineline_data = BeautifulSoup(equineline_text, "html.parser")
 
         data = equineline_data.find_all("pre", recursive=True)
+
+
         
         try:
-            data = data[0] + data[1]
+            page_one = data[0].contents[0]
+            page_two = data[1].contents[0]
 
-            horse_data = data.splitlines()
+            horse_data = (page_one + "\n" + page_two).splitlines()
 
             # Until Equineline changes their data format, we know where each piece is stored (it's a <pre>)
-            name          = horse_data[name_index[0]].split(" ")[name_index[1]][:name_index[2]]
+            # Extra steps for the name since many have multiple words
+            name_list = horse_data[name_index[0]].split(" ")
+            start_name = False
+            name = ''
+
+            for word in name_list:
+                
+                if start_name:
+                    name += word + " "
+                if word == 'of':
+                    start_name = True
+            
+            name          = name.strip()[:name_index[1]]
             crops         = [data for data in horse_data[crops_index[0]].split(" ") if data != ''][crops_index[1]]
             foals         = [data for data in horse_data[foals_index[0]].split(" ") if data != ''][foals_index[1]]
             RA_foals      = [data for data in horse_data[RA_foals_index[0]].split(" ") if data != ''][RA_foals_index[1]]
@@ -277,7 +300,7 @@ def Equineline_Get(starting_index, thread_num, out_q, accessKeyID, accessKeySecr
                                 Num_Weanlings = ?,
                                 Sales_Weanlings = ?,
                                 Num_Yearlings = ?,
-                                Sales_Yearlings = ?,
+                                Sales_Yearlings = ?
                                 WHERE EQ_link = ?; """ 
             sqlUpdateValues = (name, 
                                 crops, 
@@ -299,9 +322,10 @@ def Equineline_Get(starting_index, thread_num, out_q, accessKeyID, accessKeySecr
             counter_index +=1
 
         except Exception as e:
-            logging.error(("-"*thread_num) + "ERROR ON THREAD "+ str(thread_num) +":\n"+str(e)+"\nTrying with new headers, " + str(max_errors - equineline_failures) + " tries until moving on")
             equineline_failures += 1
+            logging.error(("-"*thread_num) + "ERROR ON THREAD "+ str(thread_num) +":\n"+str(e)+"\nTrying with new headers, " + str(max_errors - equineline_failures) + " tries until moving on")
             headers = Header_Select(equineline_failures)
+            
 
         if equineline_failures >= max_errors:
             counter_index +=1
@@ -612,6 +636,8 @@ class App(Tk):
 
             self.update()
 
+            time.sleep(60)
+
             Start_Threads(self.thcount.get(), countINT, self.AWS_ID, self.AWS_SECRET, Bloodhorse_Find_Equineline, bh_links)
 
             self.lbl.configure(text="Equineline links fetched from Bloodhorse.")
@@ -632,6 +658,8 @@ class App(Tk):
                     logging.error("No Equineline links set.")
             
             self.update()
+
+            time.sleep(60)
 
             Start_Threads(self.thcount.get(), eq_countINT, self.AWS_ID, self.AWS_SECRET, Equineline_Get, eq_links)
 
