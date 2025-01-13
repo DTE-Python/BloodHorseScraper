@@ -1,6 +1,6 @@
 import requests as Requests
 from bs4 import BeautifulSoup
-import time, threading, sqlite3, math, logging, os
+import time, threading, sqlite3, math, logging, os, pandas
 from fake_useragent import UserAgent
 from requests_ip_rotator import ApiGateway, EXTRA_REGIONS
 from queue import Queue
@@ -16,7 +16,7 @@ url_base = "https://www.bloodhorse.com"
 global set_horse_links
 set_horse_links=False
 
-logging.basicConfig(filename="webscraper.log", level=logging.INFO)
+logging.basicConfig(filename="webscraper.log", level=logging.INFO, format='%(levelname)-8s - %(message)s\n-[%(filename)s:%(lineno)d]')
 
 # Set the headers to be used when making a request
 def Header_Select(failures):
@@ -77,7 +77,7 @@ def Bloodhorse_Get(starting_page_num, thread_num, out_q, accessKeyID, accessKeyS
         connecting_url = search_page_url + str(pagenum) + url_addition
         while pagenum <= starting_page_num + page_range and not all_links_added and bloodhorse_failures <= max_errors:
             
-            logging.info(f"THREAD {thread_num} Connecting to Bloodhorse; attempt #"+str(bloodhorse_failures +1) + "\nshould be page #"+str(pagenum+1))
+            # logging.debug(f"THREAD {thread_num} Connecting to Bloodhorse; attempt #"+str(bloodhorse_failures +1) + "\nshould be page #"+str(pagenum+1))
 
             time.sleep(request_delay)
 
@@ -131,8 +131,7 @@ def Bloodhorse_Get(starting_page_num, thread_num, out_q, accessKeyID, accessKeyS
 
             out_q.put((sqlInsertRowString, sqlInsertRowValue,))
 
-        logging.info("Thread " + str(thread_num) + " sent sentinel.")
-
+    logging.info("Thread " + str(thread_num) + " sent sentinel from Bloodhorse_Get()")
     out_q.put(sentinel)
 
 # Get the Equineline links from each horse's Bloodhorse page
@@ -158,7 +157,7 @@ def Bloodhorse_Find_Equineline(starting_index, thread_num, out_q, accessKeyID, a
                 break
 
             link = bhorse_link_list[counter_index]
-            logging.info("Fetching Equineline link from "+link+" on thread #"+str(thread_num))
+            #logging.debug("Fetching Equineline link from "+link+" on thread #"+str(thread_num))
 
             time.sleep(request_delay)
 
@@ -180,9 +179,12 @@ def Bloodhorse_Find_Equineline(starting_index, thread_num, out_q, accessKeyID, a
                 headers = Header_Select(bloodhorse_failures)
             except Exception as exception:
 
-                # It's possible that an unpredicted error occurs with one link, in which case we should skip it
+                # It's possible that an unpredicted error occurs at a link, in which case we should skip it
                 if str(exception) is not str(AttributeError):
-                    logging.error("-"*thread_num +"THREAD #"+str(thread_num)+" Unhandled Error: "+str(exception))
+                    if str(exception) != "list index out of range":
+                        logging.error("-"*thread_num +"THREAD #"+str(thread_num)+" Unhandled Error: "+str(exception))
+                    else:
+                        logging.info("Equineline not found at: " + link)
                     equineline_link = "ERROR"
                     counter_index +=1
 
@@ -195,6 +197,7 @@ def Bloodhorse_Find_Equineline(starting_index, thread_num, out_q, accessKeyID, a
                 counter_index +=1
                 bloodhorse_failures = 0
 
+    logging.info("Thread " + str(thread_num) + " sent sentinel from Bloodhorse_Find_Equineline()")
     out_q.put(sentinel)
 
 # Fetch and add data from Equineline to the SQLite database
@@ -207,7 +210,7 @@ def Equineline_Get(starting_index, thread_num, out_q, accessKeyID, accessKeySecr
     # The data is then split on the " " characters (removing extra), so "hello world" becomes [hello,world]
     # to adjust these, find how many across your data is, and use that number instead of the second number. 
     # The third one is for additional formatting. If you aren't sure if you need it, remove it.
-    name_index      =   [2, -1]
+    name_index      =   [2, -1, 1]
     crops_index     =   [5, 0]
     foals_index     =   [6, 0]
     RA_foals_index  =   [24, 4]
@@ -270,7 +273,8 @@ def Equineline_Get(starting_index, thread_num, out_q, accessKeyID, accessKeySecr
                 if word == 'of':
                     start_name = True
             
-            name          = name.strip()[:name_index[1]]
+            # Certain horses will have an = in their name, this checks for that and removes it
+            name          = name.strip()[:name_index[1]][name_index[2]:] if name.strip()[:name_index[1]][0] == '=' else name.strip()[:name_index[1]]
             crops         = [data for data in horse_data[crops_index[0]].split(" ") if data != ''][crops_index[1]]
             foals         = [data for data in horse_data[foals_index[0]].split(" ") if data != ''][foals_index[1]]
             RA_foals      = [data for data in horse_data[RA_foals_index[0]].split(" ") if data != ''][RA_foals_index[1]]
@@ -331,6 +335,7 @@ def Equineline_Get(starting_index, thread_num, out_q, accessKeyID, accessKeySecr
             counter_index +=1
             equineline_failures = 0
 
+    logging.info("Thread " + str(thread_num) + " sent sentinel from Equineline_Get()")
     out_q.put(sentinel)
 
 # Execute SQL commands from the queue
@@ -431,12 +436,20 @@ class App(Tk):
         self.title("Bloodhorse and Equineline Scraper")
         
         # Window Size
-        self.geometry('700x250')
+        self.geometry('800x250')
 
             
         self.AWS_SECRET = ''
         self.AWS_ID = ''
         self.pages = 0
+
+        # Option to create a file with links to horses that had issues
+        self.unfound_horse_file = BooleanVar()
+        self.uhorse_file = Checkbutton(self, variable=self.unfound_horse_file, onvalue=True, offvalue=False)
+        self.uhorse_file.grid(column=1,row=1)
+        self.uhorse_lbl = Label(self, text="Create file with unfound horses?")
+        self.uhorse_lbl.grid(column=0,row=1)
+
 
         # First label, also becomes "running" when running
         self.lbl = Label(self, text="Update Bloodhorse Links?")
@@ -445,7 +458,7 @@ class App(Tk):
         # User chosen thread count display
         self.thcount = IntVar(value=1)
         self.lbl_thcount = Label(self, text='Thread Count: ' + str(self.thcount.get()))
-        self.lbl_thcount.grid(column=0,row=1)
+        self.lbl_thcount.grid(column=0,row=2)
 
         # Checkbox for whether to update links
         self.linkupdatevar = BooleanVar()
@@ -466,7 +479,7 @@ class App(Tk):
 
         self.thcountMenu["menu"] = self.menu
 
-        self.thcountMenu.grid(column=1, row=1)
+        self.thcountMenu.grid(column=1, row=2)
 
         # AWS access information entry
         self.accessid_entry = Entry(self)
@@ -571,7 +584,9 @@ class App(Tk):
         self.page_entry.grid_forget()
         self.thcountMenu.grid_forget()
 
-        
+        self.uhorse_file.grid_forget()
+        self.uhorse_lbl.grid_forget()
+
         self.warning.grid_forget()
         set_horse_links = self.linkupdatevar.get()
 
@@ -663,7 +678,43 @@ class App(Tk):
 
             Start_Threads(self.thcount.get(), eq_countINT, self.AWS_ID, self.AWS_SECRET, Equineline_Get, eq_links)
 
+            
+            if self.unfound_horse_file.get():
+                with sqlite3.connect("horses.db") as sqlconnection:
+                    sqlcursor = sqlconnection.cursor()
+
+                    horses_no_eq = [eq_links[0] for eq_links in sqlcursor.execute(""" SELECT BH_link FROM HORSES WHERE EQ_link == "ERROR" """)]
+
+                    horses_no_data = [horse[0] for horse in sqlcursor.execute(""" SELECT EQ_link FROM HORSES WHERE EQ_link != "ERROR" AND Name IS NULL""")]
+
+                    file_to_write = open("webscraper_horses_no_data.txt", "w")
+                    file_write_string = 'Could not retrieve a link to Equineline from these Bloodhorse pages:\n'
+
+                    for item in horses_no_eq:
+                        file_write_string += item + '\n'
+
+                    file_write_string += '\nCould not retrieve data from these Equineline pages:\n'
+
+                    for item in horses_no_data:
+                        file_write_string += item + '\n'
+
+                    file_to_write.write(file_write_string)
+                    file_to_write.close()
+
+                    sqlcursor.execute(""" DELETE FROM HORSES WHERE EQ_link != "ERROR" AND Name IS NULL""")
+                    sqlcursor.execute(""" DELETE FROM HORSES WHERE EQ_link == "ERROR" """)
+
+                    
+            conn = sqlite3.connect("horses.db", isolation_level=None,
+                       detect_types=sqlite3.PARSE_COLNAMES)
+            db_df = pandas.read_sql("SELECT * FROM HORSES", conn)
+            db_df.to_csv('database.csv', index=False)
+
             self.lbl.configure(text=" Equineline data entered.\nComplete.")
+
+
+
+            
                 
 
     # Update Thread Number
