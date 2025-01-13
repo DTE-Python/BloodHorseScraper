@@ -1,6 +1,12 @@
 import requests as Requests
 from bs4 import BeautifulSoup
-import time, threading, sqlite3, math, logging, os, pandas
+import time
+import threading
+import sqlite3
+import math
+import logging
+import os
+import pandas
 from fake_useragent import UserAgent
 from requests_ip_rotator import ApiGateway, EXTRA_REGIONS
 from queue import Queue
@@ -705,9 +711,9 @@ class App(Tk):
                     sqlcursor.execute(""" DELETE FROM HORSES WHERE EQ_link == "ERROR" """)
 
                     
-            conn = sqlite3.connect("horses.db", isolation_level=None,
+            conn = sqlite3.connect("horses copy.db", isolation_level=None,
                        detect_types=sqlite3.PARSE_COLNAMES)
-            db_df = pandas.read_sql("SELECT * FROM HORSES", conn)
+            db_df = pandas.read_sql("SELECT * FROM horses", conn)
             db_df.to_csv('database.csv', index=False)
 
             self.lbl.configure(text=" Equineline data entered.\nComplete.")
