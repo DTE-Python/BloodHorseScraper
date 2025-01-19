@@ -713,7 +713,7 @@ class App(Tk):
                     
             conn = sqlite3.connect("horses copy.db", isolation_level=None,
                        detect_types=sqlite3.PARSE_COLNAMES)
-            db_df = pandas.read_sql("SELECT * FROM horses", conn)
+            db_df = pandas.read_sql("SELECT * FROM HORSES", conn)
             db_df.to_csv('database.csv', index=False)
 
             self.lbl.configure(text=" Equineline data entered.\nComplete.")
